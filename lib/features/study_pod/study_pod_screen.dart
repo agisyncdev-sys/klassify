@@ -6,8 +6,6 @@ import 'package:just_audio/just_audio.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import '../../core/state/app_state.dart';
-import '../../core/models/study_document.dart';
-import '../../core/storage/sync_engine.dart';
 
 class StudyPodScreen extends ConsumerStatefulWidget {
   const StudyPodScreen({super.key});
@@ -16,94 +14,115 @@ class StudyPodScreen extends ConsumerStatefulWidget {
   ConsumerState<StudyPodScreen> createState() => _StudyPodScreenState();
 }
 
-class _StudyPodScreenState extends ConsumerState<StudyPodScreen> with SingleTickerProviderStateMixin {
-  final AudioPlayer _audioPlayer = AudioPlayer();
-  late AnimationController _pulseController;
+class _StudyPodScreenState extends ConsumerState<StudyPodScreen>
+    with SingleTickerProviderStateMixin {
+  final AudioPlayer _player = AudioPlayer();
+  late final AnimationController _pulse;
+
+  bool _isFileLoaded = false;
   bool _isPlaying = false;
   Duration _duration = Duration.zero;
   Duration _position = Duration.zero;
   double _speed = 1.0;
-  bool _isFileLoaded = false;
-  String? _currentAudioPath;
+
+  // Track which audio path is currently loaded so we avoid redundant reloads.
+  String? _loadedPath;
 
   @override
   void initState() {
     super.initState();
-    _pulseController = AnimationController(
+    _pulse = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 2),
     );
+
+    _player.durationStream.listen((d) {
+      if (mounted) setState(() => _duration = d ?? Duration.zero);
+    });
+
+    _player.positionStream.listen((p) {
+      if (mounted) setState(() => _position = p);
+    });
+
+    _player.playerStateStream.listen((s) {
+      if (!mounted) return;
+      setState(() {
+        _isPlaying = s.playing;
+        if (s.playing) {
+          _pulse.repeat(reverse: true);
+        } else {
+          _pulse
+            ..stop()
+            ..animateTo(0,
+                duration: const Duration(milliseconds: 400),
+                curve: Curves.easeOut);
+        }
+      });
+    });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Load audio when the active document changes (e.g. after switching tabs).
+    final path = ref.read(activeDocumentProvider)?.audioPath;
+    _loadAudio(path);
   }
 
   Future<void> _loadAudio(String? path) async {
-    if (path == _currentAudioPath) return; // Already loaded
-    _currentAudioPath = path;
-    
+    if (path == _loadedPath) return; // nothing to do
+    _loadedPath = path;
+
+    await _player.stop();
     setState(() {
       _isFileLoaded = false;
       _isPlaying = false;
-      _pulseController.stop();
+      _duration = Duration.zero;
+      _position = Duration.zero;
     });
-    
+
     if (path == null) return;
 
     try {
       final file = File(path);
-      if (await file.exists()) {
-        await _audioPlayer.setFilePath(file.path);
-        
-        if (mounted) {
-          setState(() {
-            _isFileLoaded = true;
-          });
-        }
-        
-        _audioPlayer.durationStream.listen((d) {
-          if (mounted) setState(() => _duration = d ?? Duration.zero);
-        });
-
-        _audioPlayer.positionStream.listen((p) {
-          if (mounted) setState(() => _position = p);
-        });
-
-        _audioPlayer.playerStateStream.listen((state) {
-          if (mounted) {
-            setState(() {
-              _isPlaying = state.playing;
-              if (_isPlaying) {
-                _pulseController.repeat(reverse: true);
-              } else {
-                _pulseController.stop();
-                _pulseController.animateTo(0, duration: const Duration(milliseconds: 500), curve: Curves.easeOut);
-              }
-            });
-          }
-        });
+      if (!await file.exists()) {
+        debugPrint('StudyPodScreen: audio file not found at $path');
+        return;
       }
+      await _player.setFilePath(file.path);
+      if (mounted) setState(() => _isFileLoaded = true);
     } catch (e) {
-      debugPrint('Error loading audio: $e');
+      debugPrint('StudyPodScreen._loadAudio error: $e');
     }
   }
 
   @override
   void dispose() {
-    _pulseController.dispose();
-    _audioPlayer.dispose();
+    _pulse.dispose();
+    _player.dispose();
     super.dispose();
   }
 
-  void _togglePlayPause() {
+  // ---------------------------------------------------------------------------
+  // Controls
+  // ---------------------------------------------------------------------------
+
+  void _togglePlay() {
     if (!_isFileLoaded) return;
     HapticFeedback.lightImpact();
-    
-    if (_isPlaying) {
-      _audioPlayer.pause();
-    } else {
-      _audioPlayer.play();
-    }
+    _isPlaying ? _player.pause() : _player.play();
   }
 
-  void _changeSpeed() {
+  void _seek(Duration delta) {
+    if (!_isFileLoaded) return;
+    HapticFeedback.lightImpact();
+    var target = _position + delta;
+    if (target < Duration.zero) target = Duration.zero;
+    if (target > _duration) target = _duration;
+    _player.seek(target);
+  }
+
+  void _cycleSpeed() {
     HapticFeedback.selectionClick();
     setState(() {
       if (_speed == 1.0) {
@@ -113,216 +132,191 @@ class _StudyPodScreenState extends ConsumerState<StudyPodScreen> with SingleTick
       } else {
         _speed = 1.0;
       }
-      _audioPlayer.setSpeed(_speed);
+      _player.setSpeed(_speed);
     });
   }
 
-  String _formatDuration(Duration d) {
-    String twoDigits(int n) => n.toString().padLeft(2, '0');
-    return '${twoDigits(d.inMinutes)}:${twoDigits(d.inSeconds.remainder(60))}';
+  Future<void> _share() async {
+    try {
+      final docDir = await getApplicationDocumentsDirectory();
+      final file = File('${docDir.path}/study_pod_compiled.wav');
+      if (await file.exists()) {
+        await Share.shareXFiles([XFile(file.path)],
+            text: 'Study podcast generated by Klassify!');
+      }
+    } catch (e) {
+      debugPrint('StudyPodScreen._share error: $e');
+    }
   }
+
+  String _fmt(Duration d) {
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Build
+  // ---------------------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
-    final activeDoc = ref.watch(activeDocumentProvider);
-    
-    // We call this here to ensure it updates when the active document changes.
-    // It's safe because _loadAudio has an internal check to ignore redundant calls.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _loadAudio(activeDoc?.audioPath);
+    // React to active document changes (e.g. user tapped a card in Workspace).
+    ref.listen(activeDocumentProvider, (_, next) {
+      _loadAudio(next?.audioPath);
     });
 
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+
     return Scaffold(
-      backgroundColor: Theme.of(context).colorScheme.surface,
+      backgroundColor: cs.surface,
       appBar: AppBar(
-        title: const Text('Study Pod', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 24)),
+        title: const Text('Study Pod',
+            style: TextStyle(fontWeight: FontWeight.w800, fontSize: 24)),
         elevation: 0,
         backgroundColor: Colors.transparent,
         actions: [
           IconButton(
             icon: const Icon(Icons.ios_share_rounded),
-            onPressed: _isFileLoaded ? () async {
-              final directory = await getApplicationDocumentsDirectory();
-              final file = File('${directory.path}/study_pod_compiled.wav');
-              if (await file.exists()) {
-                await Share.shareXFiles([XFile(file.path)], text: 'Check out this podcast generated by Klassify!');
-              }
-            } : null,
+            tooltip: 'Share audio',
+            onPressed: _isFileLoaded ? _share : null,
           ),
         ],
       ),
       body: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 32.0),
+          padding: const EdgeInsets.symmetric(horizontal: 32),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
+              // Pulsing icon
               AnimatedBuilder(
-                animation: _pulseController,
-                builder: (context, child) {
-                  return Transform.scale(
-                    scale: 1.0 + (_pulseController.value * 0.05),
-                    child: Container(
-                      height: 280,
-                      width: 280,
-                      decoration: BoxDecoration(
-                        color: Theme.of(context).colorScheme.primaryContainer,
-                        shape: BoxShape.circle,
-                        boxShadow: [
-                          BoxShadow(
-                            color: Theme.of(context).colorScheme.primary.withValues(alpha: 0.1 + (_pulseController.value * 0.2)),
-                            blurRadius: 40 + (_pulseController.value * 20),
-                            spreadRadius: 10 + (_pulseController.value * 10),
-                          )
-                        ],
-                      ),
-                      child: Icon(
-                        Icons.podcasts_rounded,
-                        size: 120,
-                        color: Theme.of(context).colorScheme.onPrimaryContainer,
-                      ),
+                animation: _pulse,
+                builder: (_, __) => Transform.scale(
+                  scale: 1.0 + _pulse.value * 0.05,
+                  child: Container(
+                    height: 260,
+                    width: 260,
+                    decoration: BoxDecoration(
+                      color: cs.primaryContainer,
+                      shape: BoxShape.circle,
+                      boxShadow: [
+                        BoxShadow(
+                          color: cs.primary
+                              .withValues(alpha: 0.1 + _pulse.value * 0.2),
+                          blurRadius: 40 + _pulse.value * 20,
+                          spreadRadius: 10 + _pulse.value * 10,
+                        ),
+                      ],
                     ),
-                  );
-                },
-              ),
-              const SizedBox(height: 64),
-              Text(
-                _isFileLoaded ? 'Now Playing' : 'No Script Generated',
-                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                  fontWeight: FontWeight.w900,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                _isFileLoaded ? 'Generated Script Audio' : 'Upload a PDF to begin',
-                style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    child: Icon(Icons.podcasts_rounded,
+                        size: 110, color: cs.onPrimaryContainer),
+                  ),
                 ),
               ),
               const SizedBox(height: 48),
+              Text(
+                _isFileLoaded ? 'Now Playing' : 'No Audio Generated',
+                style:
+                    tt.headlineSmall?.copyWith(fontWeight: FontWeight.w900),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                _isFileLoaded
+                    ? 'AI-generated podcast'
+                    : 'Scan a PDF in Workspace to generate audio',
+                style: tt.bodyLarge
+                    ?.copyWith(color: cs.onSurfaceVariant),
+              ),
+              const SizedBox(height: 40),
+
+              // Progress
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Text(_formatDuration(_position), style: const TextStyle(fontWeight: FontWeight.w600)),
-                  Text(_formatDuration(_duration), style: const TextStyle(fontWeight: FontWeight.w600)),
+                  Text(_fmt(_position),
+                      style: const TextStyle(fontWeight: FontWeight.w600)),
+                  Text(_fmt(_duration),
+                      style: const TextStyle(fontWeight: FontWeight.w600)),
                 ],
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: 4),
               SliderTheme(
                 data: SliderTheme.of(context).copyWith(
-                  trackHeight: 12,
-                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 14),
-                  overlayShape: const RoundSliderOverlayShape(overlayRadius: 28),
-                  activeTrackColor: Theme.of(context).colorScheme.primary,
-                  inactiveTrackColor: Theme.of(context).colorScheme.surfaceContainerHighest,
+                  trackHeight: 10,
+                  thumbShape:
+                      const RoundSliderThumbShape(enabledThumbRadius: 12),
+                  overlayShape:
+                      const RoundSliderOverlayShape(overlayRadius: 24),
+                  activeTrackColor: cs.primary,
+                  inactiveTrackColor: cs.surfaceContainerHighest,
                 ),
                 child: Slider(
-                  value: _position.inSeconds.toDouble().clamp(0.0, _duration.inSeconds.toDouble()),
-                  max: _duration.inSeconds.toDouble() > 0 ? _duration.inSeconds.toDouble() : 1.0,
-                  onChanged: _isFileLoaded ? (val) {
-                    _audioPlayer.seek(Duration(seconds: val.toInt()));
-                  } : null,
+                  value: _position.inMilliseconds
+                      .toDouble()
+                      .clamp(0.0, _duration.inMilliseconds.toDouble()),
+                  max: _duration.inMilliseconds > 0
+                      ? _duration.inMilliseconds.toDouble()
+                      : 1.0,
+                  onChanged: _isFileLoaded
+                      ? (v) => _player
+                          .seek(Duration(milliseconds: v.toInt()))
+                      : null,
                 ),
               ),
-              const SizedBox(height: 32),
+              const SizedBox(height: 24),
+
+              // Transport controls
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   IconButton(
                     icon: const Icon(Icons.replay_10_rounded),
                     iconSize: 40,
-                    color: Theme.of(context).colorScheme.onSurface,
-                    onPressed: _isFileLoaded ? () {
-                      HapticFeedback.lightImpact();
-                      final newPos = _position - const Duration(seconds: 10);
-                      _audioPlayer.seek(newPos < Duration.zero ? Duration.zero : newPos);
-                    } : null,
+                    onPressed: _isFileLoaded
+                        ? () => _seek(const Duration(seconds: -10))
+                        : null,
                   ),
-                  const SizedBox(width: 24),
+                  const SizedBox(width: 20),
                   FloatingActionButton.large(
-                    onPressed: _isFileLoaded ? _togglePlayPause : null,
+                    heroTag: 'play_pause',
+                    onPressed: _isFileLoaded ? _togglePlay : null,
                     elevation: _isPlaying ? 1 : 6,
-                    backgroundColor: _isFileLoaded ? Theme.of(context).colorScheme.primary : Theme.of(context).colorScheme.surfaceContainerHighest,
-                    foregroundColor: _isFileLoaded ? Theme.of(context).colorScheme.onPrimary : Theme.of(context).colorScheme.onSurfaceVariant,
-                    child: Icon(_isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded, size: 56),
+                    backgroundColor:
+                        _isFileLoaded ? cs.primary : cs.surfaceContainerHighest,
+                    foregroundColor: _isFileLoaded
+                        ? cs.onPrimary
+                        : cs.onSurfaceVariant,
+                    child: Icon(
+                      _isPlaying
+                          ? Icons.pause_rounded
+                          : Icons.play_arrow_rounded,
+                      size: 52,
+                    ),
                   ),
-                  const SizedBox(width: 24),
+                  const SizedBox(width: 20),
                   IconButton(
                     icon: const Icon(Icons.forward_10_rounded),
                     iconSize: 40,
-                    color: Theme.of(context).colorScheme.onSurface,
-                    onPressed: _isFileLoaded ? () {
-                      HapticFeedback.lightImpact();
-                      final newPos = _position + const Duration(seconds: 10);
-                      _audioPlayer.seek(newPos > _duration ? _duration : newPos);
-                    } : null,
+                    onPressed: _isFileLoaded
+                        ? () => _seek(const Duration(seconds: 10))
+                        : null,
                   ),
                 ],
               ),
-              const SizedBox(height: 24),
+              const SizedBox(height: 20),
+
+              // Speed toggle
               TextButton.icon(
-                onPressed: _isFileLoaded ? _changeSpeed : null,
+                onPressed: _isFileLoaded ? _cycleSpeed : null,
                 icon: const Icon(Icons.speed_rounded),
-                label: Text('${_speed}x', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                label: Text('${_speed}x',
+                    style: const TextStyle(
+                        fontWeight: FontWeight.bold, fontSize: 16)),
                 style: TextButton.styleFrom(
-                  foregroundColor: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
+                    foregroundColor: cs.onSurfaceVariant),
               ),
-              if (!_isFileLoaded)
-                Expanded(
-                  child: FutureBuilder<Map<String, dynamic>?>(
-                    future: ref.read(syncEngineProvider).readLocalData(),
-                    builder: (context, snapshot) {
-                      if (!snapshot.hasData) return const SizedBox.shrink();
-                      final script = snapshot.data?['study_pod_script'] as List<dynamic>?;
-                      if (script == null || script.isEmpty) return const SizedBox.shrink();
-                      
-                      return Container(
-                        margin: const EdgeInsets.only(top: 24, bottom: 24),
-                        decoration: BoxDecoration(
-                          color: Theme.of(context).colorScheme.surfaceContainerHighest.withValues(alpha: 0.3),
-                          borderRadius: BorderRadius.circular(24),
-                          border: Border.all(color: Theme.of(context).colorScheme.outlineVariant.withValues(alpha: 0.5)),
-                        ),
-                        child: ListView.builder(
-                          padding: const EdgeInsets.all(24),
-                          itemCount: script.length,
-                          itemBuilder: (context, index) {
-                            final line = script[index] as Map<String, dynamic>;
-                            final isSpeakerA = line['speaker'] == 'A';
-                            return Padding(
-                              padding: const EdgeInsets.only(bottom: 16.0),
-                              child: Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  CircleAvatar(
-                                    backgroundColor: isSpeakerA ? Theme.of(context).colorScheme.primary : Theme.of(context).colorScheme.secondary,
-                                    foregroundColor: Theme.of(context).colorScheme.onPrimary,
-                                    child: Text(isSpeakerA ? 'A' : 'B', style: const TextStyle(fontWeight: FontWeight.bold)),
-                                  ),
-                                  const SizedBox(width: 16),
-                                  Expanded(
-                                    child: Container(
-                                      padding: const EdgeInsets.all(16),
-                                      decoration: BoxDecoration(
-                                        color: Theme.of(context).colorScheme.surface,
-                                        borderRadius: BorderRadius.circular(16),
-                                      ),
-                                      child: Text(
-                                        line['text'] ?? '',
-                                        style: Theme.of(context).textTheme.bodyLarge?.copyWith(height: 1.5),
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            );
-                          },
-                        ),
-                      );
-                    },
-                  ),
-                ),
             ],
           ),
         ),

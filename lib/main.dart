@@ -1,38 +1,33 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:workmanager/workmanager.dart';
-import 'core/storage/background_sync_task.dart';
-
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:workmanager/workmanager.dart';
 import 'core/state/app_state.dart';
-
+import 'core/storage/background_sync_task.dart';
+import 'core/auth/google_auth_service.dart';
 import 'features/onboarding/onboarding_screen.dart';
 import 'features/main/main_shell.dart';
-import 'core/auth/google_auth_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  
-  // Prevent Google Fonts from making network requests that can
-  // block the first frame on desktop, keeping the window invisible.
+
+  // Prevent network font fetching from stalling the first frame on desktop.
   GoogleFonts.config.allowRuntimeFetching = false;
 
   final prefs = await SharedPreferences.getInstance();
 
-  if (!kIsWeb && !Platform.isWindows) {
-    Workmanager().initialize(
-      callbackDispatcher,
-    );
-    Workmanager().registerPeriodicTask(
-      "1",
-      "sync_drive_data",
+  // Background sync is only available on mobile.
+  if (!kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
+    await Workmanager().initialize(callbackDispatcher);
+    await Workmanager().registerPeriodicTask(
+      'klassify_sync',
+      'sync_drive_data',
       frequency: const Duration(minutes: 15),
-      constraints: Constraints(
-        networkType: NetworkType.connected,
-      ),
+      existingWorkPolicy: ExistingWorkPolicy.keep,
+      constraints: Constraints(networkType: NetworkType.connected),
     );
   }
 
@@ -49,11 +44,11 @@ Future<void> main() async {
 class KlassifyApp extends ConsumerWidget {
   const KlassifyApp({super.key});
 
-  static TextTheme _buildTextTheme(TextTheme base) {
+  static TextTheme _textTheme(TextTheme base) {
     try {
       return GoogleFonts.plusJakartaSansTextTheme(base);
     } catch (_) {
-      return base; // Fall back to default if fonts aren't bundled
+      return base;
     }
   }
 
@@ -68,7 +63,7 @@ class KlassifyApp extends ConsumerWidget {
           brightness: Brightness.light,
           surface: const Color(0xFFF8FAFC),
         ),
-        textTheme: _buildTextTheme(ThemeData.light().textTheme),
+        textTheme: _textTheme(ThemeData.light().textTheme),
         useMaterial3: true,
       ),
       darkTheme: ThemeData(
@@ -78,17 +73,18 @@ class KlassifyApp extends ConsumerWidget {
           surface: const Color(0xFF0F172A),
           surfaceContainerHighest: const Color(0xFF1E293B),
         ),
-        textTheme: _buildTextTheme(ThemeData.dark().textTheme),
+        textTheme: _textTheme(ThemeData.dark().textTheme),
         useMaterial3: true,
       ),
       themeMode: ThemeMode.system,
-      home: const AuthGate(),
+      home: const _AuthGate(),
     );
   }
 }
 
-class AuthGate extends ConsumerWidget {
-  const AuthGate({super.key});
+/// Checks for a cached Google session and routes to the appropriate screen.
+class _AuthGate extends ConsumerWidget {
+  const _AuthGate();
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -96,31 +92,17 @@ class AuthGate extends ConsumerWidget {
 
     return FutureBuilder<bool>(
       future: authService.signInSilently(),
-      builder: (context, snapshot) {
-        // Show loading spinner while checking auth
-        if (snapshot.connectionState == ConnectionState.waiting) {
+      builder: (context, snap) {
+        if (snap.connectionState == ConnectionState.waiting) {
           return const Scaffold(
-            body: Center(
-              child: CircularProgressIndicator(),
-            ),
+            body: Center(child: CircularProgressIndicator()),
           );
         }
-
-        // If there was an error, skip to onboarding
-        if (snapshot.hasError) {
-          debugPrint('AuthGate error: ${snapshot.error}');
-          return const OnboardingScreen();
+        if (snap.hasError) {
+          debugPrint('_AuthGate error: ${snap.error}');
         }
-
-        final isSignedIn = snapshot.data == true;
-
-        if (isSignedIn) {
-          return const MainShell();
-        } else {
-          return const OnboardingScreen();
-        }
+        return snap.data == true ? const MainShell() : const OnboardingScreen();
       },
     );
   }
 }
-

@@ -8,65 +8,106 @@ import '../../core/network/offline_llm_client.dart';
 import '../../core/state/app_state.dart';
 
 final flashcardGeneratorProvider = Provider<FlashcardGenerator>((ref) {
-  final syncEngine = ref.watch(syncEngineProvider);
-  final engineType = ref.watch(aiEngineProvider);
-  final apiKey = ref.watch(geminiApiKeyProvider);
-  return FlashcardGenerator(syncEngine, engineType, apiKey);
+  return FlashcardGenerator(
+    syncEngine: ref.watch(syncEngineProvider),
+    engineType: ref.watch(aiEngineProvider),
+    geminiApiKey: ref.watch(geminiApiKeyProvider),
+  );
 });
 
 class FlashcardGenerator {
   final SyncEngine _syncEngine;
   final AiEngineType _engineType;
   final String _geminiApiKey;
-  
-  FlashcardGenerator(this._syncEngine, this._engineType, this._geminiApiKey);
+
+  // Limit input to avoid overwhelming local LLMs or hitting Gemini context.
+  static const int _maxDocumentChars = 15000;
+  static const int _flashcardCount = 10;
+
+  FlashcardGenerator({
+    required SyncEngine syncEngine,
+    required AiEngineType engineType,
+    required String geminiApiKey,
+  })  : _syncEngine = syncEngine,
+        _engineType = engineType,
+        _geminiApiKey = geminiApiKey;
 
   Future<List<Map<String, dynamic>>> generateFlashcards(File pdfFile) async {
     try {
-      final offlineLlm = HybridLlmClient(
+      // 1. Extract text from PDF
+      final bytes = await pdfFile.readAsBytes();
+      final document = PdfDocument(inputBytes: bytes);
+      String text = PdfTextExtractor(document).extractText();
+      document.dispose();
+
+      if (text.trim().isEmpty) {
+        debugPrint('FlashcardGenerator: No text extracted from PDF.');
+        return _fallbackCards();
+      }
+
+      if (text.length > _maxDocumentChars) {
+        text = text.substring(0, _maxDocumentChars);
+      }
+
+      // 2. Build prompt
+      final prompt = '''
+You are an expert tutor. Create exactly $_flashcardCount concise flashcards based on the document text below.
+
+RULES:
+- Output ONLY a valid JSON array – no markdown, no preamble, no trailing text.
+- Each element must have exactly two string fields: "question" and "answer".
+- Questions should test understanding, not just recall.
+
+Document text:
+$text
+''';
+
+      // 3. Call LLM
+      final llm = HybridLlmClient(
         engineType: _engineType,
         geminiApiKey: _geminiApiKey,
       );
-      
-      final prompt = '''
-You are an expert tutor. Create a set of 10 concise flashcards based on the provided document text.
-Output MUST be a valid JSON array of objects with "question" and "answer" fields.
-''';
 
-      // Extract real text from the PDF binary using syncfusion
-      final PdfDocument document = PdfDocument(inputBytes: await pdfFile.readAsBytes());
-      String documentText = PdfTextExtractor(document).extractText();
-      document.dispose();
-      
-      // Prevent overwhelmingly large prompts for local LLMs by limiting text
-      if (documentText.length > 15000) {
-        documentText = documentText.substring(0, 15000);
-      }
-      final fullPrompt = '$prompt\n\nDocument Text:\n$documentText';
+      final raw = await llm.generate(prompt);
+      if (raw == null || raw.isEmpty) return _fallbackCards();
 
-      final responseText = await offlineLlm.generate(fullPrompt);
-      if (responseText != null) {
-        final List<dynamic> jsonList = jsonDecode(responseText);
-        final List<Map<String, dynamic>> flashcards = List<Map<String, dynamic>>.from(jsonList);
-        
-        // Save to local sync engine
-        await _saveFlashcards(flashcards);
-        
-        return flashcards;
-      }
-    } catch (e) {
-      debugPrint('Error generating flashcards: $e');
+      // 4. Parse
+      final decoded = jsonDecode(raw) as List<dynamic>;
+      final cards = decoded
+          .whereType<Map<String, dynamic>>()
+          .where((c) =>
+              c.containsKey('question') && c.containsKey('answer'))
+          .toList();
+
+      if (cards.isEmpty) return _fallbackCards();
+
+      // 5. Persist
+      await _persistCards(cards);
+      return cards;
+    } catch (e, stack) {
+      debugPrint('FlashcardGenerator error: $e\n$stack');
+      return _fallbackCards();
     }
-    return [];
   }
 
-  Future<void> _saveFlashcards(List<Map<String, dynamic>> newFlashcards) async {
-    final currentData = await _syncEngine.readLocalData() ?? {'flashcards': []};
-    final List<dynamic> existingCards = currentData['flashcards'] ?? [];
-    
-    existingCards.addAll(newFlashcards);
-    currentData['flashcards'] = existingCards;
-    
-    await _syncEngine.writeLocalData(currentData);
+  Future<void> _persistCards(List<Map<String, dynamic>> newCards) async {
+    try {
+      final data = await _syncEngine.readLocalData() ?? {};
+      final existing =
+          List<dynamic>.from(data['flashcards'] ?? []);
+      existing.addAll(newCards);
+      data['flashcards'] = existing;
+      await _syncEngine.writeLocalData(data);
+    } catch (e) {
+      debugPrint('FlashcardGenerator._persistCards error: $e');
+    }
   }
+
+  List<Map<String, dynamic>> _fallbackCards() => [
+        {
+          'question': 'Could not generate flashcards – what should I check?',
+          'answer':
+              'Ensure your AI engine is configured. Cloud AI needs a Gemini API key in Settings; Local AI needs Ollama running on port 11434.',
+        },
+      ];
 }

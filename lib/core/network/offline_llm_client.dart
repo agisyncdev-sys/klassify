@@ -4,112 +4,158 @@ import 'package:http/http.dart' as http;
 import 'package:google_generative_ai/google_generative_ai.dart';
 import '../state/app_state.dart';
 
+/// Unified LLM client that dispatches to either Google Gemini (cloud) or
+/// a locally-running Ollama instance (local/offline).
 class HybridLlmClient {
-  static const String defaultEndpoint = 'http://127.0.0.1:11434';
-  static const String defaultModel = 'gemma';
+  static const String _defaultOllamaEndpoint = 'http://127.0.0.1:11434';
+  static const String _defaultOllamaModel = 'gemma';
+  // Gemini Flash is free-tier and fast; bump to 'gemini-1.5-pro' for quality.
+  static const String _geminiModel = 'gemini-1.5-flash';
 
-  final String endpoint;
+  final String ollamaEndpoint;
   final AiEngineType engineType;
   final String geminiApiKey;
 
-  HybridLlmClient({
-    this.endpoint = defaultEndpoint,
+  const HybridLlmClient({
+    this.ollamaEndpoint = _defaultOllamaEndpoint,
     required this.engineType,
     required this.geminiApiKey,
   });
 
   Future<String?> generate(String prompt) async {
-    if (engineType == AiEngineType.cloud) {
-      return _generateCloud(prompt);
-    } else {
-      return _generateLocal(prompt);
-    }
+    return engineType == AiEngineType.cloud
+        ? _generateCloud(prompt)
+        : _generateLocal(prompt);
   }
 
+  // ---------------------------------------------------------------------------
+  // Cloud (Gemini)
+  // ---------------------------------------------------------------------------
+
   Future<String?> _generateCloud(String prompt) async {
-    if (geminiApiKey.isEmpty) {
-      debugPrint('Gemini API key is empty.');
-      return _getMockResponse(prompt);
+    if (geminiApiKey.trim().isEmpty) {
+      debugPrint('HybridLlmClient: Gemini API key is empty – returning mock.');
+      return _mockResponse(prompt);
     }
 
     try {
       final model = GenerativeModel(
-        model: 'gemini-1.5-flash',
-        apiKey: geminiApiKey,
+        model: _geminiModel,
+        apiKey: geminiApiKey.trim(),
+        // Instruct the model to always return raw JSON, not markdown-wrapped.
+        generationConfig: GenerationConfig(
+          responseMimeType: 'application/json',
+        ),
       );
 
-      final content = [Content.text(prompt)];
-      final response = await model.generateContent(content);
-      
-      String? rawResponse = response.text;
-      if (rawResponse != null) {
-        rawResponse = rawResponse.replaceAll('```json', '').replaceAll('```', '').trim();
-        final startIndex = rawResponse.indexOf('[');
-        final endIndex = rawResponse.lastIndexOf(']');
-        if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
-          rawResponse = rawResponse.substring(startIndex, endIndex + 1);
-        }
-        return rawResponse;
+      final response =
+          await model.generateContent([Content.text(prompt)]);
+
+      String? raw = response.text;
+      if (raw != null) {
+        return _extractJsonArray(raw);
       }
     } catch (e) {
-      debugPrint('Error calling Gemini API: $e');
+      debugPrint('HybridLlmClient (cloud) error: $e');
     }
-    return _getMockResponse(prompt);
+    return _mockResponse(prompt);
   }
+
+  // ---------------------------------------------------------------------------
+  // Local (Ollama)
+  // ---------------------------------------------------------------------------
 
   Future<String?> _generateLocal(String prompt) async {
     try {
-      final url = Uri.parse('$endpoint/api/generate');
-      
-      final response = await http.post(
-        url,
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'model': defaultModel,
-          'prompt': prompt,
-          'stream': false,
-        }),
-      ).timeout(const Duration(seconds: 120));
+      final url = Uri.parse('$ollamaEndpoint/api/generate');
+
+      final response = await http
+          .post(
+            url,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'model': _defaultOllamaModel,
+              'prompt': prompt,
+              'stream': false,
+              'format': 'json', // Ask Ollama to enforce JSON output
+            }),
+          )
+          .timeout(const Duration(seconds: 180));
 
       if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        String rawResponse = data['response'] as String;
-        
-        // Strip out markdown code blocks that LLMs often wrap JSON in
-        rawResponse = rawResponse.replaceAll('```json', '').replaceAll('```', '').trim();
-        
-        // Extract just the JSON array from the response in case the model added conversational text
-        final startIndex = rawResponse.indexOf('[');
-        final endIndex = rawResponse.lastIndexOf(']');
-        if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
-          rawResponse = rawResponse.substring(startIndex, endIndex + 1);
-        }
-        
-        return rawResponse;
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final raw = data['response'] as String? ?? '';
+        return _extractJsonArray(raw);
       } else {
-        debugPrint('Ollama API Error: ${response.statusCode} - ${response.body}');
+        debugPrint(
+            'HybridLlmClient (local) HTTP ${response.statusCode}: ${response.body}');
       }
     } catch (e) {
-      debugPrint('Error calling offline LLM (Is Ollama running?): $e');
-      // If Ollama is not running or fails, return a robust mock response so the UI doesn't break
-      return _getMockResponse(prompt);
+      debugPrint(
+          'HybridLlmClient (local) error (is Ollama running?): $e');
     }
-    return _getMockResponse(prompt);
+    return _mockResponse(prompt);
   }
 
-  String _getMockResponse(String prompt) {
-    if (prompt.contains('podcast scriptwriter')) {
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+
+  /// Strips markdown fences and extracts the first JSON array from [raw].
+  String _extractJsonArray(String raw) {
+    // Strip common markdown wrappers
+    raw = raw
+        .replaceAll('```json', '')
+        .replaceAll('```', '')
+        .trim();
+
+    final start = raw.indexOf('[');
+    final end = raw.lastIndexOf(']');
+    if (start != -1 && end != -1 && end > start) {
+      return raw.substring(start, end + 1);
+    }
+    return raw;
+  }
+
+  /// Returns a minimal valid mock JSON array so the UI never crashes when the
+  /// AI backend is unavailable.
+  String _mockResponse(String prompt) {
+    final isPodcast = prompt.contains('podcast scriptwriter');
+    if (isPodcast) {
       return jsonEncode([
-        {"speaker": "A", "text": "Welcome to today's study pod! Since your AI engine isn't responding, I'm a fallback simulation."},
-        {"speaker": "B", "text": "That's good to know! How do I fix this?"},
-        {"speaker": "A", "text": "If using Local AI, ensure Ollama is installed and running. If using Cloud AI, check your API key in Settings!"}
-      ]);
-    } else {
-      return jsonEncode([
-        {"question": "What is the status of the AI?", "answer": "The AI engine is currently unreachable or the API key is missing."},
-        {"question": "How do I fix this?", "answer": "Check your API key in Settings, or run Ollama if using Local mode."},
-        {"question": "Will my data stay private?", "answer": "Yes, everything is secured either locally or in your personal Drive."}
+        {
+          'speaker': 'A',
+          'text':
+              "Welcome to today's study pod! The AI engine is currently unreachable.",
+        },
+        {
+          'speaker': 'B',
+          'text': 'How do I fix that?',
+        },
+        {
+          'speaker': 'A',
+          'text':
+              'If using Local AI, make sure Ollama is installed and running. '
+                  'If using Cloud AI, check that your Gemini API key is correct in Settings.',
+        },
       ]);
     }
+    return jsonEncode([
+      {
+        'question': 'Why is the AI not responding?',
+        'answer':
+            'The AI engine is unreachable. Check your API key or Ollama status.',
+      },
+      {
+        'question': 'Will my data stay private?',
+        'answer':
+            'Yes – everything is stored locally or in your personal Google Drive.',
+      },
+      {
+        'question': 'How do I switch AI engines?',
+        'answer':
+            'Go to Settings and choose between Cloud AI (Gemini) and Local AI (Ollama).',
+      },
+    ]);
   }
 }

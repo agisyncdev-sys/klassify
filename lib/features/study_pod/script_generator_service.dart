@@ -1,7 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
-import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
 import '../../core/storage/sync_engine.dart';
@@ -9,60 +8,116 @@ import '../../core/network/offline_llm_client.dart';
 import '../../core/state/app_state.dart';
 
 final scriptGeneratorServiceProvider = Provider<ScriptGeneratorService>((ref) {
-  final syncEngine = ref.watch(syncEngineProvider);
-  final engineType = ref.watch(aiEngineProvider);
-  final apiKey = ref.watch(geminiApiKeyProvider);
-  return ScriptGeneratorService(syncEngine, engineType, apiKey);
+  return ScriptGeneratorService(
+    syncEngine: ref.watch(syncEngineProvider),
+    engineType: ref.watch(aiEngineProvider),
+    geminiApiKey: ref.watch(geminiApiKeyProvider),
+  );
 });
 
 class ScriptGeneratorService {
   final SyncEngine _syncEngine;
   final AiEngineType _engineType;
   final String _geminiApiKey;
-  
-  ScriptGeneratorService(this._syncEngine, this._engineType, this._geminiApiKey);
+
+  static const int _maxDocumentChars = 15000;
+
+  ScriptGeneratorService({
+    required SyncEngine syncEngine,
+    required AiEngineType engineType,
+    required String geminiApiKey,
+  })  : _syncEngine = syncEngine,
+        _engineType = engineType,
+        _geminiApiKey = geminiApiKey;
 
   Future<List<Map<String, dynamic>>> generateScript(File pdfFile) async {
     try {
-      final offlineLlm = HybridLlmClient(
+      // 1. Extract text from PDF
+      final bytes = await pdfFile.readAsBytes();
+      final document = PdfDocument(inputBytes: bytes);
+      String text = PdfTextExtractor(document).extractText();
+      document.dispose();
+
+      if (text.trim().isEmpty) {
+        debugPrint('ScriptGeneratorService: No text extracted from PDF.');
+        return _fallbackScript();
+      }
+
+      if (text.length > _maxDocumentChars) {
+        text = text.substring(0, _maxDocumentChars);
+      }
+
+      // 2. Build prompt
+      final prompt = '''
+You are an expert podcast scriptwriter. Create a natural, conversational 2-person study podcast script based on the document text below.
+
+SPEAKERS:
+- Speaker A: the expert who explains concepts clearly.
+- Speaker B: the curious student who asks follow-up questions.
+
+RULES:
+- Output ONLY a valid JSON array – no markdown, no preamble, no trailing text.
+- Each element must have exactly two string fields: "speaker" (value "A" or "B") and "text".
+- Aim for 12–16 exchanges. Keep each line under 3 sentences.
+
+Document text:
+$text
+''';
+
+      // 3. Call LLM
+      final llm = HybridLlmClient(
         engineType: _engineType,
         geminiApiKey: _geminiApiKey,
       );
 
-      final prompt = '''
-You are an expert podcast scriptwriter. Create a conversational 2-person script based on the provided document.
-Speaker A is the expert, Speaker B is the student.
-Output MUST be a valid JSON array of objects with "speaker" and "text" fields.
-''';
+      final raw = await llm.generate(prompt);
+      if (raw == null || raw.isEmpty) return _fallbackScript();
 
-      // Extract real text from the PDF binary using syncfusion
-      final PdfDocument document = PdfDocument(inputBytes: await pdfFile.readAsBytes());
-      String documentText = PdfTextExtractor(document).extractText();
-      document.dispose();
-      
-      // Prevent overwhelmingly large prompts for local LLMs by limiting text
-      if (documentText.length > 15000) {
-        documentText = documentText.substring(0, 15000);
-      }
-      final fullPrompt = '$prompt\n\nDocument Text:\n$documentText';
+      // 4. Parse & validate
+      final decoded = jsonDecode(raw) as List<dynamic>;
+      final lines = decoded
+          .whereType<Map<String, dynamic>>()
+          .where((l) =>
+              (l['speaker'] == 'A' || l['speaker'] == 'B') &&
+              (l['text'] as String?)?.isNotEmpty == true)
+          .toList();
 
-      final responseText = await offlineLlm.generate(fullPrompt);
-      if (responseText != null) {
-        final List<dynamic> jsonList = jsonDecode(responseText);
-        final List<Map<String, dynamic>> script = List<Map<String, dynamic>>.from(jsonList);
-        
-        await _saveScriptToLocal(script);
-        return script;
-      }
-    } catch (e) {
-      debugPrint('Error generating script: $e');
+      if (lines.isEmpty) return _fallbackScript();
+
+      // 5. Persist
+      await _persistScript(lines);
+      return lines;
+    } catch (e, stack) {
+      debugPrint('ScriptGeneratorService error: $e\n$stack');
+      return _fallbackScript();
     }
-    return [];
   }
 
-  Future<void> _saveScriptToLocal(List<Map<String, dynamic>> script) async {
-    final currentData = await _syncEngine.readLocalData() ?? {};
-    currentData['study_pod_script'] = script;
-    await _syncEngine.writeLocalData(currentData);
+  Future<void> _persistScript(List<Map<String, dynamic>> script) async {
+    try {
+      final data = await _syncEngine.readLocalData() ?? {};
+      data['study_pod_script'] = script;
+      await _syncEngine.writeLocalData(data);
+    } catch (e) {
+      debugPrint('ScriptGeneratorService._persistScript error: $e');
+    }
   }
+
+  List<Map<String, dynamic>> _fallbackScript() => [
+        {
+          'speaker': 'A',
+          'text':
+              "Welcome to Study Pod! It looks like the AI engine wasn't able to generate a script.",
+        },
+        {
+          'speaker': 'B',
+          'text': 'How can I fix that?',
+        },
+        {
+          'speaker': 'A',
+          'text':
+              'Head to Settings. If you chose Cloud AI, make sure your Gemini API key is entered. '
+                  'If you chose Local AI, ensure Ollama is installed and running on your machine.',
+        },
+      ];
 }

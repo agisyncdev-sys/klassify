@@ -1,18 +1,19 @@
 plugins {
     id("com.android.application")
     id("kotlin-android")
-    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
 
 android {
-    namespace = "com.example.klassify"
+    namespace = "com.yourcompany.klassify"  // TODO: change to your bundle ID
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        // Required for WorkManager with desugaring support
+        isCoreLibraryDesugaringEnabled = true
     }
 
     kotlinOptions {
@@ -20,25 +21,30 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.example.klassify"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        applicationId = "com.yourcompany.klassify"  // TODO: change to your bundle ID
+        // google_mlkit_document_scanner requires minSdk 21.
+        // workmanager requires minSdk 21.
+        minSdk = 21
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        multiDexEnabled = true
     }
 
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
+            // TODO: configure your own signing config before publishing.
             signingConfig = signingConfigs.getByName("debug")
+            isMinifyEnabled = false
         }
     }
 }
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    // Required for Java 8+ APIs on older Android versions (WorkManager needs this)
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
 }

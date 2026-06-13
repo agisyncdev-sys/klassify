@@ -12,15 +12,23 @@ final syncEngineProvider = Provider<SyncEngine>((ref) {
   return SyncEngine(authService);
 });
 
+/// Handles reading/writing the canonical JSON data file both locally and to
+/// Google Drive appDataFolder (for seamless cross-device sync).
 class SyncEngine {
   final GoogleAuthService _authService;
-  static const String _fileName = 'student_data.json';
+
+  static const String _dataFileName = 'student_data.json';
+  static const int _maxLocalDocuments = 5; // LRU eviction threshold
 
   SyncEngine(this._authService);
 
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+
   Future<File> get _localFile async {
-    final directory = await getApplicationDocumentsDirectory();
-    return File('${directory.path}/$_fileName');
+    final dir = await getApplicationDocumentsDirectory();
+    return File('${dir.path}/$_dataFileName');
   }
 
   Future<drive.DriveApi?> _getDriveApi() async {
@@ -29,6 +37,39 @@ class SyncEngine {
     return drive.DriveApi(client);
   }
 
+  // ---------------------------------------------------------------------------
+  // Local read / write
+  // ---------------------------------------------------------------------------
+
+  Future<Map<String, dynamic>?> readLocalData() async {
+    final file = await _localFile;
+    if (!await file.exists()) return null;
+    try {
+      final contents = await file.readAsString();
+      if (contents.trim().isEmpty) return null;
+      return jsonDecode(contents) as Map<String, dynamic>;
+    } catch (e) {
+      debugPrint('SyncEngine.readLocalData error: $e');
+      return null;
+    }
+  }
+
+  Future<void> writeLocalData(Map<String, dynamic> data) async {
+    try {
+      final file = await _localFile;
+      await file.writeAsString(jsonEncode(data));
+      // Fire-and-forget Drive upload; don't block the UI.
+      syncUp().catchError(
+          (e) => debugPrint('SyncEngine.syncUp background error: $e'));
+    } catch (e) {
+      debugPrint('SyncEngine.writeLocalData error: $e');
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Drive sync
+  // ---------------------------------------------------------------------------
+
   Future<void> syncDown() async {
     final driveApi = await _getDriveApi();
     if (driveApi == null) return;
@@ -36,23 +77,27 @@ class SyncEngine {
     try {
       final fileList = await driveApi.files.list(
         spaces: 'appDataFolder',
-        q: "name = '$_fileName'",
+        q: "name = '$_dataFileName'",
         $fields: 'files(id, name)',
       );
 
       final files = fileList.files;
-      if (files != null && files.isNotEmpty) {
-        final fileId = files.first.id!;
-        final media = await driveApi.files.get(fileId, downloadOptions: drive.DownloadOptions.fullMedia) as drive.Media;
-        
-        final localFile = await _localFile;
-        final sink = localFile.openWrite();
-        await media.stream.pipe(sink);
-        await sink.close();
-        debugPrint('Synced $_fileName from Drive AppData.');
-      }
+      if (files == null || files.isEmpty) return;
+
+      final fileId = files.first.id!;
+      final media = await driveApi.files.get(
+        fileId,
+        downloadOptions: drive.DownloadOptions.fullMedia,
+      ) as drive.Media;
+
+      final localFile = await _localFile;
+      final sink = localFile.openWrite();
+      await media.stream.pipe(sink);
+      await sink.flush();
+      await sink.close();
+      debugPrint('SyncEngine: synced $_dataFileName down from Drive.');
     } catch (e) {
-      debugPrint('Error syncing down: $e');
+      debugPrint('SyncEngine.syncDown error: $e');
     }
   }
 
@@ -66,117 +111,125 @@ class SyncEngine {
     try {
       final fileList = await driveApi.files.list(
         spaces: 'appDataFolder',
-        q: "name = '$_fileName'",
+        q: "name = '$_dataFileName'",
         $fields: 'files(id, name)',
       );
 
       final files = fileList.files;
-      final fileContent = await localFile.readAsBytes();
-      final media = drive.Media(Stream.value(fileContent), fileContent.length);
+      final bytes = await localFile.readAsBytes();
+      final media = drive.Media(Stream.value(bytes), bytes.length,
+          contentType: 'application/json');
 
       if (files != null && files.isNotEmpty) {
-        final fileId = files.first.id!;
         await driveApi.files.update(
           drive.File(),
-          fileId,
+          files.first.id!,
           uploadMedia: media,
         );
-        debugPrint('Updated $_fileName in Drive AppData.');
+        debugPrint('SyncEngine: updated $_dataFileName in Drive.');
       } else {
         final driveFile = drive.File()
-          ..name = _fileName
+          ..name = _dataFileName
           ..parents = ['appDataFolder'];
-        await driveApi.files.create(
-          driveFile,
-          uploadMedia: media,
-        );
-        debugPrint('Created $_fileName in Drive AppData.');
+        await driveApi.files.create(driveFile, uploadMedia: media);
+        debugPrint('SyncEngine: created $_dataFileName in Drive.');
       }
     } catch (e) {
-      debugPrint('Error syncing up: $e');
+      debugPrint('SyncEngine.syncUp error: $e');
     }
   }
 
-  Future<Map<String, dynamic>?> readLocalData() async {
-    final file = await _localFile;
-    if (!await file.exists()) return null;
+  // ---------------------------------------------------------------------------
+  // Document management
+  // ---------------------------------------------------------------------------
+
+  Future<List<StudyDocument>> loadAllDocuments() async {
+    final data = await readLocalData() ?? {};
+    final list = data['documents'] as List<dynamic>? ?? [];
     try {
-      final contents = await file.readAsString();
-      return jsonDecode(contents) as Map<String, dynamic>;
+      return list
+          .map((e) => StudyDocument.fromJson(e as Map<String, dynamic>))
+          .toList();
     } catch (e) {
-      debugPrint('Error reading local data: $e');
-      return null;
+      debugPrint('SyncEngine.loadAllDocuments parse error: $e');
+      return [];
     }
   }
 
-  Future<void> writeLocalData(Map<String, dynamic> data) async {
-    try {
-      final file = await _localFile;
-      await file.writeAsString(jsonEncode(data));
-      await syncUp();
-    } catch (e) {
-      debugPrint('Error writing local data: $e');
+  Future<void> saveStudyDocument(StudyDocument doc) async {
+    final data = await readLocalData() ?? {};
+    final list = List<dynamic>.from(data['documents'] ?? []);
+
+    final idx = list.indexWhere(
+        (e) => (e as Map<String, dynamic>)['id'] == doc.id);
+    if (idx >= 0) {
+      list[idx] = doc.toJson();
+    } else {
+      list.add(doc.toJson());
     }
+
+    data['documents'] = list;
+    await writeLocalData(data);
+    await enforceLRUPolicy();
   }
+
+  Future<void> deleteStudyDocument(String docId) async {
+    final data = await readLocalData() ?? {};
+    final list = List<dynamic>.from(data['documents'] ?? []);
+    list.removeWhere(
+        (e) => (e as Map<String, dynamic>)['id'] == docId);
+    data['documents'] = list;
+    await writeLocalData(data);
+  }
+
+  // ---------------------------------------------------------------------------
+  // File metadata & LRU eviction
+  // ---------------------------------------------------------------------------
 
   Future<void> recordAccessTime(String fileId, String localPath) async {
     final data = await readLocalData() ?? {};
-    final metadata = data['files_metadata'] as Map<String, dynamic>? ?? {};
-    
-    metadata[fileId] = {
+    final meta =
+        Map<String, dynamic>.from(data['files_metadata'] ?? {});
+
+    meta[fileId] = {
       'lastAccessed': DateTime.now().toIso8601String(),
       'localPath': localPath,
     };
-    
-    data['files_metadata'] = metadata;
+    data['files_metadata'] = meta;
     await writeLocalData(data);
     await enforceLRUPolicy();
   }
 
   Future<void> enforceLRUPolicy() async {
     final data = await readLocalData() ?? {};
-    final metadata = data['files_metadata'] as Map<String, dynamic>? ?? {};
-    
-    if (metadata.length <= 5) return;
+    final meta =
+        Map<String, dynamic>.from(data['files_metadata'] ?? {});
 
-    final entries = metadata.entries.toList()
+    if (meta.length <= _maxLocalDocuments) return;
+
+    final sorted = meta.entries.toList()
       ..sort((a, b) {
-        final timeA = DateTime.parse(a.value['lastAccessed'] as String);
-        final timeB = DateTime.parse(b.value['lastAccessed'] as String);
-        return timeB.compareTo(timeA); // newest first
+        final ta = DateTime.parse(
+            (a.value as Map<String, dynamic>)['lastAccessed'] as String);
+        final tb = DateTime.parse(
+            (b.value as Map<String, dynamic>)['lastAccessed'] as String);
+        return tb.compareTo(ta); // newest first
       });
 
-    // Prune everything after index 4
-    for (int i = 5; i < entries.length; i++) {
-      final localPath = entries[i].value['localPath'] as String?;
-      if (localPath != null) {
-        final file = File(localPath);
-        if (await file.exists()) {
-          await file.delete();
-          debugPrint('Evicted physical file to save space: $localPath');
+    for (int i = _maxLocalDocuments; i < sorted.length; i++) {
+      final lp =
+          (sorted[i].value as Map<String, dynamic>)['localPath'] as String?;
+      if (lp != null) {
+        final f = File(lp);
+        if (await f.exists()) {
+          await f.delete();
+          debugPrint('SyncEngine: LRU evicted $lp');
         }
       }
+      meta.remove(sorted[i].key);
     }
-  }
 
-  Future<List<StudyDocument>> loadAllDocuments() async {
-    final data = await readLocalData() ?? {};
-    final documentsJson = data['documents'] as List<dynamic>? ?? [];
-    return documentsJson.map((e) => StudyDocument.fromJson(e as Map<String, dynamic>)).toList();
-  }
-
-  Future<void> saveStudyDocument(StudyDocument doc) async {
-    final data = await readLocalData() ?? {};
-    final documentsJson = data['documents'] as List<dynamic>? ?? [];
-    
-    final index = documentsJson.indexWhere((e) => (e as Map)['id'] == doc.id);
-    if (index >= 0) {
-      documentsJson[index] = doc.toJson();
-    } else {
-      documentsJson.add(doc.toJson());
-    }
-    
-    data['documents'] = documentsJson;
+    data['files_metadata'] = meta;
     await writeLocalData(data);
   }
 }

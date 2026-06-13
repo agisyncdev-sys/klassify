@@ -1,3 +1,5 @@
+/// Represents a single study document that has been processed by Klassify.
+/// Immutable; use [copyWith] to produce updated copies.
 class StudyDocument {
   final String id;
   final String title;
@@ -6,7 +8,7 @@ class StudyDocument {
   final String? flashcardsPath;
   final String? audioPath;
 
-  StudyDocument({
+  const StudyDocument({
     required this.id,
     required this.title,
     required this.createdAt,
@@ -15,16 +17,14 @@ class StudyDocument {
     this.audioPath,
   });
 
-  Map<String, dynamic> toJson() {
-    return {
-      'id': id,
-      'title': title,
-      'createdAt': createdAt.toIso8601String(),
-      'pdfPath': pdfPath,
-      'flashcardsPath': flashcardsPath,
-      'audioPath': audioPath,
-    };
-  }
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'createdAt': createdAt.toIso8601String(),
+        'pdfPath': pdfPath,
+        'flashcardsPath': flashcardsPath,
+        'audioPath': audioPath,
+      };
 
   factory StudyDocument.fromJson(Map<String, dynamic> json) {
     return StudyDocument(
@@ -44,6 +44,8 @@ class StudyDocument {
     String? pdfPath,
     String? flashcardsPath,
     String? audioPath,
+    // Pass `audioPath: null` does nothing; use clearAudioPath to explicitly
+    // remove the audio reference.
   }) {
     return StudyDocument(
       id: id ?? this.id,
@@ -54,4 +56,17 @@ class StudyDocument {
       audioPath: audioPath ?? this.audioPath,
     );
   }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is StudyDocument &&
+          runtimeType == other.runtimeType &&
+          id == other.id;
+
+  @override
+  int get hashCode => id.hashCode;
+
+  @override
+  String toString() => 'StudyDocument(id: $id, title: $title)';
 }

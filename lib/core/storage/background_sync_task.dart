@@ -3,32 +3,33 @@ import 'package:workmanager/workmanager.dart';
 import 'sync_engine.dart';
 import '../auth/google_auth_service.dart';
 
+/// Entry-point called by WorkManager from a background isolate.
+/// MUST be a top-level function annotated with @pragma('vm:entry-point').
 @pragma('vm:entry-point')
 void callbackDispatcher() {
   Workmanager().executeTask((task, inputData) async {
-    debugPrint("Native called background task: $task");
-    
+    debugPrint('Background task started: $task');
+
     try {
       final authService = GoogleAuthService();
-      // Silently sign in to get the valid auth token for Drive
-      final account = await authService.signInSilently();
-      
-      if (account != null) {
+      final isSignedIn = await authService.signInSilently();
+
+      if (isSignedIn) {
         final syncEngine = SyncEngine(authService);
-        // Sync down to merge any Drive updates
         await syncEngine.syncDown();
-        // Sync up to push local changes
         await syncEngine.syncUp();
-        
-        debugPrint("Background sync completed successfully.");
-        return Future.value(true);
+        debugPrint('Background sync completed for task: $task');
+        return true;
       } else {
-        debugPrint("Background sync failed: User not signed in.");
-        return Future.value(false);
+        debugPrint('Background sync skipped – user not signed in.');
+        // Return true so WorkManager doesn't retry immediately; the next
+        // scheduled execution will try again once the user has logged in.
+        return true;
       }
-    } catch (err) {
-      debugPrint("Background sync failed: $err");
-      return Future.value(false);
+    } catch (e, stack) {
+      debugPrint('Background sync error: $e\n$stack');
+      // Return false to signal WorkManager to retry later.
+      return false;
     }
   });
 }
